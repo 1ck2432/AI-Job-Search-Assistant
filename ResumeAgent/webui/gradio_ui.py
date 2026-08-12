@@ -1,14 +1,16 @@
 """
-webui/gradio_ui.py - Gradio 五 Tab 前端界面
+webui/gradio_ui.py - Gradio 六 Tab 前端界面
 
 Tab1: 知识库管理 - 上传 PDF/Word 入库、查看文档、清空库、检索测试、统计图表
 Tab2: 简历 & JD 匹配分析 - 上传解析、雷达图/柱状图、缺失技能清单
 Tab3: 简历智能优化 - 左右分栏对比、差异高亮、优化模式、下载 Word
 Tab4: AI 模拟面试 - 聊天对话界面、流式输出、暂停/重置、复盘报告下载
 Tab5: 历史记录 - 查看匹配/简历/面试记录
+Tab6: 自主 Agent - 输入自然语言任务，ReActAgent 自主调用工具完成（v2.0）
 """
 
 import difflib
+import json
 import os
 import re
 import tempfile
@@ -48,6 +50,7 @@ from core.tools.score_tool import (
     scores_to_dict,
 )
 from core.tools.sqlite_db import RecordManager
+from core.graph.workflow_graph import run_agentic_task
 
 # ============================================================
 # 辅助函数
@@ -1231,11 +1234,88 @@ def build_tab5_history() -> None:
 
 
 # ============================================================
+# Tab6: 自主 Agent（v2.0 - ReAct 自主任务）
+# ============================================================
+
+def _format_agentic_trace(trace) -> str:
+    """将 agentic_trace（ReActStep 的 dict 列表）格式化为可读轨迹。"""
+    if not trace:
+        return "_（无推理轨迹）_"
+    lines = [f"[ReAct 轨迹] 共 {len(trace)} 步"]
+    for s in trace:
+        lines.append(f"\nStep {s.get('step_index', '?')}:")
+        lines.append(f"  Thought    : {s.get('thought', '')}")
+        lines.append(f"  Action     : {s.get('action', '')}")
+        action_input = json.dumps(s.get("action_input", {}), ensure_ascii=False)
+        lines.append(f"  Action Input: {action_input}")
+        obs = str(s.get("observation", "")).replace("\n", "\n    ")
+        lines.append(f"  Observation: {obs}")
+    return "\n".join(lines)
+
+
+def _agentic_run(task: str, use_fast_path: bool) -> str:
+    """执行自主 Agent 任务，返回结果 + 推理轨迹。"""
+    if not task or not task.strip():
+        return "⚠️ 请先输入任务描述。"
+
+    try:
+        result = run_agentic_task(task=task, fast_path=use_fast_path)
+        answer = result.agentic_result
+        trace = _format_agentic_trace(result.agentic_trace)
+        return f"## 🤖 最终回答\n\n{answer}\n\n---\n\n{trace}"
+    except Exception as e:
+        logger.error(f"自主 Agent 任务失败: {e}")
+        return f"❌ 自主任务执行失败: {e}"
+
+
+def build_tab6_agentic():
+    """自主 Agent Tab：自然语言任务 → ReAct 自主调用工具完成"""
+    with gr.Row():
+        gr.Markdown(
+            """
+            ### 🤖 自主 Agent（ReAct）
+            > 输入任意自然语言任务，Agent 将自主完成 **思考 → 行动 → 观察** 循环，
+            > 调用内置工具（加权评分 / 等级映射 / 匹配报告 / 知识库检索 / 报告导出）完成任务。
+
+            **示例任务**：
+            - `技能80 经验60 学历90，计算加权综合得分并给出等级`
+            - `生成一份三维度匹配分析报告并导出为 txt 文件`
+            - `在知识库中检索 RAG 相关的简历资料`
+            """
+        )
+
+    with gr.Row():
+        agentic_task = gr.Textbox(
+            label="任务描述",
+            placeholder="例：技能80 经验60 学历90，计算加权综合得分并给出等级",
+            lines=3,
+            scale=4,
+        )
+        with gr.Column(scale=1):
+            use_fast_path = gr.Checkbox(
+                label="快速路径（跳过解析/检索/评分）",
+                value=True,
+                info="关闭后走完整 LangGraph 图，可复用简历/JD 上下文",
+            )
+            btn_agentic = gr.Button("🚀 执行自主任务", variant="primary")
+
+    with gr.Row():
+        agentic_result = gr.Markdown("")
+        agentic_trace = gr.Markdown("")
+
+    btn_agentic.click(
+        _agentic_run,
+        inputs=[agentic_task, use_fast_path],
+        outputs=[agentic_result],
+    )
+
+
+# ============================================================
 # 主界面组装
 # ============================================================
 
 def create_ui() -> gr.Blocks:
-    """创建完整 Gradio 五 Tab 界面"""
+    """创建完整 Gradio 六 Tab 界面"""
     with gr.Blocks(
         title=settings.GRADIO_TITLE,
     ) as demo:
@@ -1262,6 +1342,9 @@ def create_ui() -> gr.Blocks:
 
             with gr.TabItem("📜 历史记录"):
                 build_tab5_history()
+
+            with gr.TabItem("🤖 自主 Agent"):
+                build_tab6_agentic()
 
     return demo
 

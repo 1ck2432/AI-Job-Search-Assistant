@@ -8,25 +8,31 @@ core/graph/workflow_graph.py - LangGraph 多智能体工作流编排
       ▼
   parse_node ──→ retrieve_node ──→ score_node
                                       │
-                        ┌─────────────┴──────────────┐
-                        │ next_action == "optimize"  │ next_action == "interview"
-                        ▼                            ▼
-                   optimize_node               interview_node
-                        │                            │
-          ┌─────────────┼─────────────┐              │
-          │ re_optimize │ interview   │ end          │
-          ▼             ▼             ▼              │
-     optimize_node  interview_node   END             │
-                        │                            │
-                        └────────────┬───────────────┘
-                                     ▼
-                               summary_node
-                                     │
-                                    END
+                 ┌────────────────────┼──────────────────────┐
+                 │ next_action ==    │ next_action ==       │ next_action ==
+                 │ "optimize"        │ "interview"          │ "agentic" (v2.0)
+                 ▼                    ▼                      ▼
+            optimize_node       interview_node         agentic_node
+                 │                    │              (ReAct 自主任务)
+   ┌─────────────┼─────────────┐      │                      │
+   │ re_optimize │ interview   │ end  │                      │
+   ▼             ▼             ▼      │                      │
+optimize_node interview_node  END     │                      │
+                 │                    │                      │
+                 └────────────┬───────┘                      │
+                              ▼                              │
+                        summary_node                         │
+                              │                              │
+                             END ◄───────────────────────────┘
 
 人工介入断点：
 - interrupt_before=["optimize"]：优化前可手动修改简历
 - interrupt_before=["interview"]：面试前可更换 JD 重新开始
+
+v2.0 新增自主 Agent 分支：
+- score 节点后 next_action == "agentic" → agentic_node
+- agentic_node 基于自研 ReActAgent（Thought/Action/Observation 循环）
+  自主调度评分/检索/导出工具完成用户任务，任务完成即结束
 
 使用示例：
     graph = build_workflow()
@@ -60,25 +66,29 @@ from core.graph.agent_nodes import (
     interview_generate_question,
     summary_node,
 )
+from core.graph.agentic_node import agentic_node
 
 
 # ============================================================
 # 条件路由函数
 # ============================================================
 
-def route_after_score(state: AgentState) -> Literal["optimize", "interview"]:
+def route_after_score(state: AgentState) -> Literal["optimize", "interview", "agentic"]:
     """
     评分后的分支路由。
 
     逻辑：
     - next_action == "optimize" → 进入简历优化分支
     - next_action == "interview" → 直接进入面试分支（默认）
+    - next_action == "agentic"  → 进入自主 Agent 分支（v2.0，ReAct 自主任务）
     """
     action = state.next_action
     logger.info(f"[路由] 评分后分支 → {action}")
 
     if action == "optimize":
         return "optimize"
+    if action == "agentic":
+        return "agentic"
     return "interview"
 
 
@@ -133,8 +143,11 @@ def build_workflow(
     workflow.add_node("optimize", optimize_node)
     workflow.add_node("interview", interview_generate_question)
     workflow.add_node("summary", summary_node)
+    workflow.add_node("agentic", agentic_node)  # v2.0: 自主 Agent 节点（ReAct）
 
-    logger.info("  节点已注册: parse, retrieve, score, optimize, interview, summary")
+    logger.info(
+        "  节点已注册: parse, retrieve, score, optimize, interview, summary, agentic"
+    )
 
     # ----------------------------------------------------------
     # 线性边：parse → retrieve → score
@@ -152,6 +165,7 @@ def build_workflow(
         {
             "optimize": "optimize",
             "interview": "interview",
+            "agentic": "agentic",  # v2.0: 自主 Agent 分支
         },
     )
 
@@ -167,6 +181,11 @@ def build_workflow(
             END: END,                     # 直接结束
         },
     )
+
+    # ----------------------------------------------------------
+    # 自主 Agent 分支：任务完成即结束（v2.0）
+    # ----------------------------------------------------------
+    workflow.add_edge("agentic", END)
 
     # ----------------------------------------------------------
     # 线性边：面试 → 复盘 → 结束
@@ -363,3 +382,61 @@ def run_summary_step(
 
     logger.info(f"[Summary] 报告生成完成 | length={len(updated.interview_report)}")
     return updated
+
+
+def run_agentic_task(
+    task: str,
+    resume_raw: str = "",
+    jd_raw: str = "",
+    thread_id: str = "agentic-default",
+    fast_path: bool = True,
+) -> AgentState:
+    """
+    运行自主 Agent 任务（v2.0 新增）。
+
+    ReActAgent 自主完成用户任务，支持两种路径：
+    - fast_path=True（默认）: 直接调用 agentic_node，跳过解析/检索/评分，
+      适合纯自主任务（无需简历/JD 上下文）
+    - fast_path=False: 走完整 LangGraph 图（parse→retrieve→score→agentic），
+      任务可复用简历/JD 与 RAG 上下文
+
+    Args:
+        task:         用户任务描述（如 "技能80 经验60 学历90，算综合得分并导出报告"）
+        resume_raw:   简历文本（fast_path=False 时生效）
+        jd_raw:       JD 文本（fast_path=False 时生效）
+        thread_id:    会话 ID
+        fast_path:    True 跳过前置节点直接执行自主任务
+
+    Returns:
+        AgentState: 含 agentic_result（最终回答）与 agentic_trace（推理轨迹）
+    """
+    logger.info(f"[Agentic] 启动自主任务 thread={thread_id} fast_path={fast_path}")
+
+    if fast_path:
+        state = AgentState(
+            resume_raw=resume_raw,
+            jd_raw=jd_raw,
+            next_action="agentic",
+            agentic_task=task,
+        )
+        result = agentic_node(state)
+        return state.model_copy(update=result)
+
+    # 完整图路径
+    graph = get_workflow()
+    config = {"configurable": {"thread_id": thread_id}}
+    initial_state = AgentState(
+        resume_raw=resume_raw,
+        jd_raw=jd_raw,
+        next_action="agentic",
+        agentic_task=task,
+    )
+    result = graph.invoke(initial_state, config)
+    if isinstance(result, dict):
+        result = AgentState(**result)
+
+    logger.info(
+        f"[Agentic] 自主任务完成 | answer_len={len(result.agentic_result)} "
+        f"trace_steps={len(result.agentic_trace)}"
+    )
+    return result

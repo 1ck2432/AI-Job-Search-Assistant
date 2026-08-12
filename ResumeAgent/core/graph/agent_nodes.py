@@ -11,12 +11,17 @@ core/graph/agent_nodes.py - 六大 Agent 业务节点
   4. optimize_node    - 简历 STAR 优化改写（支持多轮迭代）
   5. interview_node   - AI 模拟面试官（生成问题 + 评分点评）
   6. summary_node     - 面试复盘总结 + 学习资料推荐
+
+v2.0 变更：score / interview 节点改为 Function Calling 强制结构化输出
+（bind_tools 直接返回结构化参数，替换脆弱的 JSON 文本解析），
+模型不支持工具调用时自动回退到 _parse_llm_json。
 """
 
 from typing import Optional
 
 from loguru import logger
 from langchain_core.documents import Document
+from pydantic import BaseModel, Field
 
 from config.settings import settings
 from core.graph.agent_state import AgentState, MatchScoreDetail, InterviewQA
@@ -24,7 +29,7 @@ from core.rag.document_loader import DocumentLoader
 from core.rag.text_splitter import DocumentSplitter
 from core.rag.retriever import get_retriever
 from core.llm import get_llm
-from core.llm.base import ChatMessage
+from core.llm.base import ChatMessage, pydantic_model_to_tool
 
 
 # ============================================================
@@ -77,6 +82,100 @@ def _parse_llm_json(text: str) -> dict:
         text = brace_match.group(0)
 
     return json.loads(text)
+
+
+# ============================================================
+# v2.0 结构化输出（Function Calling 替代 JSON 解析）
+# ============================================================
+
+class ScoreResultSchema(BaseModel):
+    """四维度匹配评估的结构化输出 schema"""
+    skill_match: float = Field(ge=0, le=100, description="专业技能匹配度 0-100")
+    experience_match: float = Field(ge=0, le=100, description="项目经验匹配度 0-100")
+    education_match: float = Field(ge=0, le=100, description="学历背景匹配度 0-100")
+    overall_score: float = Field(ge=0, le=100, description="综合加权得分 0-100")
+    skill_gap: list[str] = Field(default_factory=list, description="候选人缺失技能清单")
+    analysis: str = Field(default="", description="200 字以内简短分析")
+
+
+class InterviewQuestionSchema(BaseModel):
+    """面试题生成的结构化输出 schema"""
+    question: str = Field(default="", description="面试问题文本")
+    category: str = Field(default="general", description="问题类别")
+    expected_points: list[str] = Field(default_factory=list, description="期望回答要点")
+    difficulty: str = Field(default="medium", description="难度: easy/medium/hard")
+
+
+class InterviewEvalSchema(BaseModel):
+    """面试回答评估的结构化输出 schema"""
+    score: float = Field(ge=0, le=100, description="评分 0-100")
+    feedback: str = Field(default="", description="50 字以内点评")
+    strengths: list[str] = Field(default_factory=list, description="回答优点")
+    weaknesses: list[str] = Field(default_factory=list, description="回答不足")
+
+
+def _structured_extract(
+    llm,
+    system_prompt: str,
+    user_prompt: str,
+    schema: type[BaseModel],
+    tool_name: str,
+    tool_desc: str,
+    temperature: float = 0.1,
+) -> dict:
+    """
+    v2.0 结构化输出核心函数。
+
+    优先使用 Function Calling（bind_tools + 强制指定工具）让模型直接返回
+    结构化 tool_call 参数，彻底告别 JSON 字符串解析；
+    模型不支持工具调用时自动回退到 _parse_llm_json 文本解析。
+
+    Args:
+        llm:          LLM 实例
+        system_prompt: 系统提示
+        user_prompt:   用户提示
+        schema:        Pydantic 结构化输出模型
+        tool_name:     工具名（schema 声明）
+        tool_desc:     工具描述
+        temperature:   推理温度
+
+    Returns:
+        dict: 结构化字段（与 schema 字段对齐）；失败返回 {}
+    """
+    tool = pydantic_model_to_tool(schema, tool_name, tool_desc)
+    messages = [
+        ChatMessage.system(system_prompt),
+        ChatMessage.user(user_prompt),
+    ]
+
+    llm.update_config(temperature=temperature)
+    try:
+        resp = llm.chat_with_tools(
+            messages,
+            tools=[tool],
+            tool_choice={"type": "function", "function": {"name": tool.name}},
+            with_retry=False,
+        )
+        if resp.has_tool_calls:
+            logger.info(
+                f"  Function Calling 结构化输出成功: tool={resp.tool_calls[0].name} "
+                f"args_keys={list(resp.tool_calls[0].arguments.keys())}"
+            )
+            return dict(resp.tool_calls[0].arguments)
+        logger.warning("  模型未返回 tool_call，回退 JSON 文本解析")
+        return _parse_llm_json(resp.text)
+    except NotImplementedError:
+        logger.warning("  当前 LLM 不支持 Function Calling，回退 JSON 文本解析")
+    except Exception as e:
+        logger.warning(f"  Function Calling 失败，回退 JSON 文本解析: {e}")
+
+    # 回退：普通 chat + JSON 文本解析
+    try:
+        resp = llm.chat(messages, with_retry=False)
+        return _parse_llm_json(resp.text)
+    except Exception as e:
+        logger.error(f"  结构化抽取最终失败: {e}")
+        return {}
 
 
 # ============================================================
@@ -273,15 +372,17 @@ def score_node(state: AgentState) -> dict:
 
     try:
         llm = get_llm()
-        llm.update_config(temperature=0.1)  # 低温度保证结构化输出稳定
 
-        resp = llm.chat([
-            ChatMessage.system(system_prompt),
-            ChatMessage.user(user_prompt),
-        ])
-
-        # 解析 JSON
-        result = _parse_llm_json(resp.text)
+        # v2.0: Function Calling 强制结构化输出，失败自动回退 JSON 解析
+        result = _structured_extract(
+            llm,
+            system_prompt,
+            user_prompt,
+            ScoreResultSchema,
+            "evaluate_match_score",
+            "对候选人与岗位进行四维度匹配评估，输出结构化评分结果",
+            temperature=0.1,
+        )
 
         # 校验并构造 MatchScoreDetail
         match_score = MatchScoreDetail(
@@ -538,13 +639,17 @@ def interview_generate_question(state: AgentState) -> dict:
 
     try:
         llm = get_llm()
-        llm.update_config(temperature=0.7)  # 较高温度增加问题多样性
 
-        resp = llm.chat([
-            ChatMessage.system(INTERVIEWER_SYSTEM_PROMPT),
-            ChatMessage.user(user_prompt),
-        ])
-        result = _parse_llm_json(resp.text)
+        # v2.0: Function Calling 强制结构化输出，失败自动回退 JSON 解析
+        result = _structured_extract(
+            llm,
+            INTERVIEWER_SYSTEM_PROMPT,
+            user_prompt,
+            InterviewQuestionSchema,
+            "generate_interview_question",
+            "根据岗位与候选人背景生成下一道面试题",
+            temperature=0.7,
+        )
         question = result.get("question", "请简单介绍一下你自己")
         category = result.get("category", "general")
 
@@ -616,13 +721,17 @@ def interview_evaluate_answer(state: AgentState, round_index: int, answer: str) 
 
     try:
         llm = get_llm()
-        llm.update_config(temperature=0.2)
 
-        resp = llm.chat([
-            ChatMessage.system("你是一位严谨的面试官，请客观评分。"),
-            ChatMessage.user(eval_prompt),
-        ])
-        result = _parse_llm_json(resp.text)
+        # v2.0: Function Calling 强制结构化输出，失败自动回退 JSON 解析
+        result = _structured_extract(
+            llm,
+            "你是一位严谨的面试官，请客观评分。",
+            eval_prompt,
+            InterviewEvalSchema,
+            "evaluate_interview_answer",
+            "评估候选人面试回答并输出评分与点评",
+            temperature=0.2,
+        )
         score = float(result.get("score", 70))
         feedback = result.get("feedback", "回答已记录")
 

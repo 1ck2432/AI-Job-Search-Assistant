@@ -8,8 +8,14 @@ core/llm/openai_llm.py - OpenAI / DeepSeek 云端 API 实现
 - 非流式 chat()
 - 流式 chat() 逐 token 输出
 - 自定义 temperature/top_p/max_tokens 等推理参数
+- Function Calling（bind_tools，结构化工具调用 / 结构化输出）
+
+v2.0 新增:
+- chat_with_tools(): 基于 ChatOpenAI.bind_tools() 实现真工具调用
+- 兼容 OpenAI / DeepSeek 的 tool_calls 返回格式
 """
 
+import json
 from typing import Generator, Optional
 
 from langchain_openai import ChatOpenAI
@@ -18,7 +24,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from loguru import logger
 
 from config.settings import settings
-from .base import BaseLLM, LLMConfig, LLMResponse, ChatMessage
+from .base import BaseLLM, LLMConfig, LLMResponse, ChatMessage, ToolDefinition, ToolCall
 
 
 class OpenAILLM(BaseLLM):
@@ -187,6 +193,79 @@ class OpenAILLM(BaseLLM):
             logger.error(f"{self._provider.upper()} 非流式调用失败: {e}")
             return LLMResponse(
                 content=f"[{self._provider.upper()} 调用失败] {e}",
+                model=self.config.model,
+                finish_reason="error",
+            )
+
+    def _chat_with_tools_impl(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolDefinition],
+        tool_choice: Optional[str | dict],
+    ) -> LLMResponse:
+        """
+        Function Calling 实现：基于 ChatOpenAI.bind_tools()。
+
+        兼容 OpenAI / DeepSeek 的 tool_calls 返回格式，
+        同时解析字符串或 dict 两种 arguments 形式。
+        """
+        try:
+            lc_msgs = self._to_langchain_messages(messages)
+            bound = self._client.bind_tools(
+                [t.to_openai_tool() for t in tools],
+                tool_choice=tool_choice,
+            )
+            response = bound.invoke(lc_msgs)
+
+            content = self._extract_content(response)
+            tool_calls: list[ToolCall] = []
+            for tc in getattr(response, "tool_calls", []) or []:
+                name = tc.get("name", "")
+                raw_args = tc.get("args", {})
+                # args 可能是 dict（标准）或 JSON 字符串（部分兼容 API）
+                if isinstance(raw_args, str):
+                    try:
+                        raw_args = json.loads(raw_args)
+                    except Exception:
+                        raw_args = {}
+                if not isinstance(raw_args, dict):
+                    raw_args = {}
+                tool_calls.append(
+                    ToolCall(name=name, arguments=raw_args, id=tc.get("id", ""))
+                )
+
+            # 提取元信息
+            usage = {}
+            finish_reason = "tool_calls" if tool_calls else "stop"
+            if hasattr(response, "response_metadata"):
+                meta = response.response_metadata
+                token_info = meta.get("token_usage", {})
+                usage = {
+                    "token_usage": token_info,
+                    "model_name": meta.get("model_name", self.config.model),
+                }
+                finish_reason = token_info.get(
+                    "finish_reason",
+                    meta.get("finish_reason", finish_reason),
+                )
+
+            if not content and not tool_calls:
+                logger.warning(
+                    f"{self._provider.upper()} 工具调用返回空内容 | "
+                    f"response.type={type(response).__name__}"
+                )
+
+            return LLMResponse(
+                content=content or "",
+                model=self.config.model,
+                usage=usage,
+                finish_reason=finish_reason,
+                tool_calls=tool_calls,
+            )
+        except Exception as e:
+            logger.error(f"{self._provider.upper()} Function Calling 失败: {e}")
+            return LLMResponse(
+                content=f"[{self._provider.upper()} 工具调用失败] {e}",
                 model=self.config.model,
                 finish_reason="error",
             )

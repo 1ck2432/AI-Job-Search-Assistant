@@ -5,18 +5,22 @@ core/llm/ollama_llm.py - Ollama 本地模型实现
 - 非流式 chat()
 - 流式 chat() 逐 token 输出
 - 自定义 temperature/top_p 等推理参数
+- Function Calling（bind_tools，依赖模型原生工具支持，如 qwen2.5 / llama3.1+）
+
+v2.0 新增:
+- chat_with_tools(): 基于 ChatOllama.bind_tools() 实现真工具调用
 """
 
+import json
 from typing import Generator, Optional
 
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langchain_core.outputs import LLMResult
 
 from loguru import logger
 
 from config.settings import settings
-from .base import BaseLLM, LLMConfig, LLMResponse, ChatMessage
+from .base import BaseLLM, LLMConfig, LLMResponse, ChatMessage, ToolDefinition, ToolCall
 
 
 class OllamaLLM(BaseLLM):
@@ -109,6 +113,68 @@ class OllamaLLM(BaseLLM):
             logger.error(f"Ollama 非流式调用失败: {e}")
             return LLMResponse(
                 content=f"[调用失败] {e}",
+                model=self.config.model,
+                finish_reason="error",
+            )
+
+    def _chat_with_tools_impl(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolDefinition],
+        tool_choice: Optional[str | dict],
+    ) -> LLMResponse:
+        """
+        Function Calling 实现：基于 ChatOllama.bind_tools()。
+
+        要求本地模型支持工具调用（qwen2.5 / llama3.1+ 均支持）。
+        """
+        try:
+            lc_msgs = self._to_langchain_messages(messages)
+            bound = self._client.bind_tools(
+                [t.to_openai_tool() for t in tools],
+                tool_choice=tool_choice,
+            )
+            response = bound.invoke(lc_msgs)
+
+            content = getattr(response, "content", "") or ""
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        parts.append(item.get("text", ""))
+                    elif isinstance(item, str):
+                        parts.append(item)
+                content = "".join(parts).strip()
+
+            tool_calls: list[ToolCall] = []
+            for tc in getattr(response, "tool_calls", []) or []:
+                name = tc.get("name", "")
+                raw_args = tc.get("args", {})
+                if isinstance(raw_args, str):
+                    try:
+                        raw_args = json.loads(raw_args)
+                    except Exception:
+                        raw_args = {}
+                if not isinstance(raw_args, dict):
+                    raw_args = {}
+                tool_calls.append(
+                    ToolCall(name=name, arguments=raw_args, id=tc.get("id", ""))
+                )
+
+            usage = response.response_metadata or {}
+            finish_reason = "tool_calls" if tool_calls else usage.get("done_reason", "stop")
+
+            return LLMResponse(
+                content=content,
+                model=self.config.model,
+                usage=usage,
+                finish_reason=finish_reason,
+                tool_calls=tool_calls,
+            )
+        except Exception as e:
+            logger.error(f"Ollama Function Calling 失败: {e}")
+            return LLMResponse(
+                content=f"[Ollama 工具调用失败] {e}",
                 model=self.config.model,
                 finish_reason="error",
             )

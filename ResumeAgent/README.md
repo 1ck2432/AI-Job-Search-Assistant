@@ -31,9 +31,10 @@ ResumeAgent 是一个基于多智能体（Multi-Agent）架构的求职辅助平
 
 | 组件 | 技术选型 |
 |------|----------|
-| 前端 | Gradio 4.x（五 Tab 交互界面） |
-| 智能体编排 | LangGraph（状态图工作流） |
-| LLM 后端 | Ollama / OpenAI / DeepSeek 多模式切换 |
+| 前端 | Gradio 6.x（六 Tab 交互界面） |
+| 智能体编排 | LangGraph（状态图工作流，7 节点 + 条件路由） |
+| Agent 引擎 | 自研 ReActAgent（Thought/Action/Observation 循环） |
+| LLM 后端 | Ollama / OpenAI / DeepSeek 多模式切换（Function Calling） |
 | 向量检索 | ChromaDB + Sentence-Transformers |
 | 数据持久化 | SQLite（WAL 模式） |
 | 图表渲染 | Plotly（雷达图/柱状图） |
@@ -43,17 +44,20 @@ ResumeAgent 是一个基于多智能体（Multi-Agent）架构的求职辅助平
 
 ## 功能特性
 
-### 五大核心模块
+### 六大核心模块
 
 1. **知识库管理** - 上传文件入库、向量检索测试、库统计可视化
 2. **简历 & JD 匹配分析** - 智能解析、多维评分、雷达图/柱状图、缺失技能表
 3. **简历智能优化** - 高亮对比、三种优化模式、一键导出 Word
 4. **AI 模拟面试** - 流式对话、逐轮评分、复盘报告下载
 5. **历史记录** - SQLite 数据查询展示、统计概览
+6. **自主 Agent（v2.0）** - 输入自然语言任务，自研 ReActAgent 自主调度工具完成并展示推理轨迹
 
 ### 特色能力
 
 - **多 LLM 兼容**: 本地 Ollama + 云端 OpenAI/DeepSeek 无缝切换
+- **Function Calling**: ToolDefinition/ToolCall 统一抽象，pydantic_model_to_tool 强制结构化输出
+- **自研 ReAct 引擎**: Thought→Action→Observation 循环、工具注册表、重复动作检测、参数别名归一化
 - **检索引擎**: RAG 技术结合向量搜索，自动召回相关知识库片段
 - **分数量化**: 技能/经验/学历三维加权评分，自动生成雷达图
 - **流式输出**: 面试对话支持 SSE 流式响应对接
@@ -70,7 +74,8 @@ ResumeAgent 是一个基于多智能体（Multi-Agent）架构的求职辅助平
 ├─ Tab2: 简历&JD匹配分析 ───────┤
 ├─ Tab3: 简历智能优化 ──────────┤
 ├─ Tab4: AI模拟面试 ────────────┤
-└─ Tab5: 历史记录 ──────────────┘
+├─ Tab5: 历史记录 ──────────────┤
+└─ Tab6: 自主Agent任务 ─────────┘
         │
         ▼
 ┌─────────────────────────────────────────┐
@@ -88,6 +93,10 @@ ResumeAgent 是一个基于多智能体（Multi-Agent）架构的求职辅助平
 │  三种模式优化    逐轮面试+评分           │
 │                                          │
 │  summary_node (复盘报告生成)             │
+│                                          │
+│  agentic_node (v2.0 自研 ReActAgent)     │
+│  ─ 读取 agentic_task，Thought/Action/    │
+│    Observation 循环，调度内置工具自主完成 │
 └─────────────────────────────────────────┘
         │
         ▼
@@ -117,14 +126,19 @@ ResumeAgent/
 │   └── settings.py           # 全局配置（Pydantic Settings，读取根目录 .env）
 ├── core/
 │   ├── llm/
-│   │   ├── base.py           # LLM 抽象基类 + 重试机制
-│   │   ├── ollama_llm.py     # Ollama 本地推理
-│   │   ├── openai_llm.py     # OpenAI / DeepSeek API
+│   │   ├── base.py           # LLM 抽象基类 + 重试机制 + Function Calling (v2.0)
+│   │   ├── ollama_llm.py     # Ollama 本地推理（bind_tools）
+│   │   ├── openai_llm.py     # OpenAI / DeepSeek API（bind_tools）
 │   │   └── __init__.py       # LLM 工厂
+│   ├── agents/               # v2.0 自研 ReAct 引擎
+│   │   ├── react_agent.py    # ReActAgent：Thought/Action/Observation 循环
+│   │   ├── tool_registry.py  # 工具注册表：ReActTool + builtin_tools
+│   │   └── __init__.py
 │   ├── graph/
 │   │   ├── agent_state.py    # AgentState Pydantic 数据模型
-│   │   ├── agent_nodes.py    # LangGraph 节点实现
-│   │   └── workflow_graph.py # 状态图构建
+│   │   ├── agent_nodes.py    # LangGraph 节点实现（Function Calling 结构化输出）
+│   │   ├── agentic_node.py   # 第 7 节点：自主 Agent (v2.0)
+│   │   └── workflow_graph.py # 状态图构建 + run_agentic_task 封装
 │   ├── rag/
 │   │   ├── document_loader.py # 文档加载与清洗
 │   │   ├── text_splitter.py  # 语义切片
@@ -140,7 +154,9 @@ ResumeAgent/
 ├── database/
 │   └── db.py                 # SQLite ORM 管理层
 ├── webui/
-│   └── gradio_ui.py          # Gradio 五 Tab 界面
+│   └── gradio_ui.py          # Gradio 六 Tab 界面（含自主 Agent Tab）
+├── examples/
+│   └── react_demo.py         # v2.0 ReAct 命令行演示
 ├── uploads/                   # 上传文件目录
 ├── chroma_db/                 # 向量库持久化目录
 ├── logs/                      # 日志文件目录

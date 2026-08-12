@@ -157,6 +157,22 @@ class AgentState(BaseModel):
     )
 
     # ----------------------------------------------------------
+    # 自主 Agent 层：ReAct 自主任务节点（v2.0）
+    # ----------------------------------------------------------
+    agentic_task: str = Field(
+        default="",
+        description="自主 Agent 节点接收的用户任务（ReAct 循环输入）",
+    )
+    agentic_result: str = Field(
+        default="",
+        description="自主 Agent 节点的最终回答（Final Answer）",
+    )
+    agentic_trace: list[dict] = Field(
+        default_factory=list,
+        description="自主 Agent 节点的完整推理轨迹（Thought/Action/Observation）",
+    )
+
+    # ----------------------------------------------------------
     # 元信息：状态追踪与路由控制
     # ----------------------------------------------------------
     current_node: str = Field(
@@ -165,7 +181,7 @@ class AgentState(BaseModel):
     )
     next_action: str = Field(
         default="interview",
-        description="路由控制指令: interview | optimize | re_optimize | end",
+        description="路由控制指令: interview | optimize | re_optimize | agentic | end",
     )
 
     # ----------------------------------------------------------
