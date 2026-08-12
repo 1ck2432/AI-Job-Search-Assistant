@@ -1,0 +1,42 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+venv/
+.venv/
+env/
+pip-wheel-metadata/
+
+# ===== 环境变量（严禁提交，含 API Key 等敏感信息） =====
+.env
+.env.*
+!.env.example
+
+# ===== 运行时数据（含用户简历、日志等个人信息，严禁提交） =====
+uploads/
+exports/
+logs/
+vector_store/
+chroma_db/
+database/*.db
+database/*.db-journal
+database/*.db-wal
+database/*.db-shm
+
+# ===== IDE / 系统文件 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 测试与缓存 =====
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

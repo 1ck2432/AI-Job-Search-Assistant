@@ -1,0 +1,17 @@
+# ===== 个人文件（含姓名/简历等信息，严禁提交到 GitHub） =====
+*.docx
+*.pdf
+*.jpg
+*.jpeg
+*.png
+~$*.docx
+
+# ===== 环境变量（严禁提交，含 API Key） =====
+.env
+
+# ===== IDE / 系统文件 =====
+.codebuddy/
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
